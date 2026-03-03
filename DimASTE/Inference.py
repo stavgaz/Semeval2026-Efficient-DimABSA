@@ -1,3 +1,7 @@
+# ============================================================
+# IMPORTS
+# ============================================================
+
 import json
 import requests
 import argparse
@@ -24,48 +28,66 @@ from peft import (
     PeftModel,
 )
 
-# --- 5. IMPORTANT: NOW SAFE TO IMPORT TRL CONFIG ---
+# TRL config imported but NOT used in this inference script (not fatal, can remove)
 from trl import SFTConfig
 
-from datasets import load_dataset
+from datasets import load_dataset  # NOT used (not fatal, can remove)
 from tqdm import tqdm
 import unicodedata
 
 
-# --- Data Preparation Functions (No changes) ---
-# --- Data Preparation Functions (No changes) ---
+# ============================================================
+# Data loading helpers
+# ============================================================
+
 def load_jsonl_url(url: str) -> List[Dict]:
+    """
+    Download JSONL file from a URL and parse each line.
+    """
     resp = requests.get(url)
     resp.raise_for_status()
     return [json.loads(line) for line in resp.text.splitlines()]
 
 def load_jsonl_file(filepath: str) -> List[Dict]:
+    """
+    Load JSONL file from local disk and parse each line.
+    """
     with open(filepath, "r", encoding="utf-8") as f:
         return [json.loads(line) for line in f]
 
 def load_prompt(lang, domain):
-    with open("/leonardo_work/EUHPC_D19_014/dimABSA/dimABSA/prompts2.jsonl", "r") as f:
+    """
+    Load an inference prompt template from prompts2.jsonl (despite .jsonl, using json.load).
+    This requires prompts2.jsonl to be a single JSON object, not JSONL.
+    """
+    with open("./prompts2.jsonl", "r") as f:
         prompts = json.load(f)
 
     key = f"{lang}_{domain}"
     p = prompts[key]
-    
     prompt = p["prompt"]
     return prompt
 
-# --- START: MODIFIED PREDICTION PROMPT FUNCTION (Few-Shot & Re-ordered) ---
+
+# ============================================================
+# Prompt creation (inference)
+# ============================================================
+
 def create_prediction_prompt(data_sample: Dict, model_name: str, language: str = "eng", domain: str = 'res') -> str:
     """
-    Creates a formatted, prompt string for INFERENCE/PREDICTION.
-    Supports multilingual instructions via the 'language' parameter.
-    Languages: 'eng', 'zho', 'jpn', 'rus', 'tat', 'ukr'.
-    """
+    Build a chat prompt that asks the model to output triplets/quads as JSON.
 
-    # 3. Get the instruction based on language (Default to English 'eng' if not found)
+    NOTE: This function is model-family specific:
+      - Llama uses <|begin_of_text|> / <|start_header_id|> ... and <|eot_id|>
+      - Qwen uses <|im_start|> ... <|im_end|>
+
+    FATAL RISK: For some (model_name, language) pairs, `prompt` might not be assigned.
+    Consider setting prompt=None and raising if still None at the end.
+    """
     instruction = load_prompt(language, domain)
-    
     text = data_sample['Text'].replace("` ` ", "")
-    
+
+    # Llama prompt format (only English supported here)
     if "llama" in model_name.lower():
         if language == 'eng':
             prompt = f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
@@ -76,7 +98,8 @@ Review: \"{text}\"<|eot_id|>
 
 <|start_header_id|>assistant<|end_header_id|>
 """
-    
+
+    # Qwen prompt format (multiple languages supported, but NO 'eng' branch)
     if "qwen" in model_name.lower():
         if language == 'zho':
             prompt = f"""<|im_start|>user
@@ -110,9 +133,7 @@ Review: \"{text}\"<|eot_id|>
 <|im_end|>
 <|im_start|>assistant
 """
-
         elif language == 'rus':
-
             prompt = f"""<|im_start|>user
 {instruction}
 
@@ -122,38 +143,38 @@ Review: \"{text}\"<|eot_id|>
 """
 
     return prompt
-# --- END: MODIFIED PREDICTION PROMPT FUNCTION ---
+
+
+# ============================================================
+# Span alignment: map predicted string back to original substring
+# ============================================================
 
 def get_original_span(full_text: str, predicted_span: str) -> str:
     """
-    Robustly maps the model's predicted span back to the exact substring in the raw text.
-    Handles:
-      1. Spacing differences (\t, \n, spaces, ideographic \u3000)
-      2. Full-width / half-width characters
-      3. Case differences (Latin/Cyrillic)
-      4. Tokenization artifacts
+    Attempt to map a predicted span back to an exact substring in the original review.
+    Helps evaluation if the scorer expects exact spans.
     """
     if not predicted_span:
         return predicted_span
 
-    # 1. Check for exact match first
+    # 1) Exact match
     if predicted_span in full_text:
         return predicted_span
 
-    # 2. Normalize full-width characters
+    # 2) Normalize full-width/half-width
     full_text_norm = unicodedata.normalize("NFKC", full_text)
     predicted_span_norm = unicodedata.normalize("NFKC", predicted_span)
 
-    # 3. Remove all whitespace for fuzzy matching
+    # 3) Remove whitespace for fuzzy matching
     full_text_nosp = "".join(c for c in full_text_norm if not c.isspace())
     predicted_nosp = "".join(c for c in predicted_span_norm if not c.isspace())
 
-    # 4. Try exact match (case-sensitive)
+    # 4) Search case-sensitive then case-insensitive
     start_idx = full_text_nosp.find(predicted_nosp)
     if start_idx == -1:
-        # 5. Case-insensitive match
         start_idx = full_text_nosp.lower().find(predicted_nosp.lower())
 
+    # 5) Map back to original indices in normalized text
     if start_idx != -1:
         end_idx = start_idx + len(predicted_nosp)
         current = 0
@@ -169,70 +190,63 @@ def get_original_span(full_text: str, predicted_span: str) -> str:
                 break
             current += 1
 
+        # Return slice from the original raw text indices
         if start_real != -1 and end_real != -1:
-            return full_text[start_real:end_real+1]
+            return full_text[start_real:end_real + 1]
 
-    # Fallback
     return predicted_span
+
+
+# ============================================================
+# Convert raw test data -> prompt JSONL for inference
+# ============================================================
 
 def convert_prediction_data(raw_data: List[Dict], output_file: str, model_name: str, language: str = "eng", domain: str = 'res'):
     """
-    Converts data using the new strategy (separate Valence/Arousal keys).
-    Supports multilingual data (Chinese, Japanese, Cyrillic) via ensure_ascii=False.
+    Create an intermediate JSONL file with:
+      - ID
+      - prompt_text (chat prompt)
+      - raw_text (original review)
     """
     new_dataset = []
     for data_sample in raw_data:
         try:
-            # FINAL EVAL: Prompt only, hide labels
             prompt_string = create_prediction_prompt(data_sample, model_name, language, domain)
-            
-            # We MUST use the *original* format for labels for the metric calculator
-            # ensure_ascii=False here is critical for human readability of CJK labels
             new_dataset.append({
-                "ID": data_sample['ID'], 
+                "ID": data_sample['ID'],
                 "prompt_text": prompt_string,
-                "raw_text": data_sample['Text'].replace("` ` ", ""), 
+                "raw_text": data_sample['Text'].replace("` ` ", ""),
             })
-
-        except KeyError as e:
-            pass 
+        except KeyError:
+            # Missing ID/Text
+            pass
         except Exception as e:
             print(f"Error processing sample: {e}\nSample ID: {data_sample.get('ID', 'Unknown')}")
-    
+
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    
-    # CRITICAL: ensure_ascii=False prevents Chinese/Russian from turning into \uXXXX garbage
+
     with open(output_file, 'w', encoding='utf-8') as f:
         for item in new_dataset:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
-            
+
     print(f"Data conversion complete! File saved to {output_file}.")
     print(f"Total prompts generated: {len(new_dataset)}")
 
-def parse_va_string(va_str: str) -> Optional[Tuple[float, float]]:
-    try:
-        v_str, a_str = va_str.split('#')
-        v = float(v_str)
-        a = float(a_str)
-        if not (1.0 <= v <= 9.0 and 1.0 <= a <= 9.0):
-            return None
-        return (v, a)
-    except (ValueError, TypeError, AttributeError):
-        return None
-# --- End Data Preparation Functions ---
+
+# ============================================================
+# JSON extraction from model output
+# ============================================================
 
 def extract_json_list(text: str) -> List[dict]:
     """
-    Extracts the FIRST valid JSON list from a model output.
-    Returns [] if nothing valid can be recovered.
-    Robust for Chinese/Japanese/Korean text.
+    Try to recover the FIRST valid JSON list/dict from model output.
+    Returns [] if nothing can be recovered.
     """
     if not text or not isinstance(text, str):
         return []
 
     raw = text.strip()
-    
-    # Normalize quotes, remove \r and tabs
+
     repaired = (
         raw.replace("“", '"').replace("”", '"')
            .replace("’", "'")
@@ -240,10 +254,9 @@ def extract_json_list(text: str) -> List[dict]:
            .replace("\t", " ")
     )
 
-    # Remove extra commas before closing brackets
     repaired = re.sub(r",(\s*[\]\}])", r"\1", repaired)
 
-    # Try direct load
+    # Direct json.loads
     try:
         obj = json.loads(repaired)
         if isinstance(obj, dict):
@@ -253,7 +266,7 @@ def extract_json_list(text: str) -> List[dict]:
     except:
         pass
 
-    # Try to extract any JSON lists (including nested)
+    # Extract list-like substring
     matches = re.findall(r"\[[^\]]*?\]", repaired)
     for m in matches:
         try:
@@ -261,7 +274,7 @@ def extract_json_list(text: str) -> List[dict]:
         except:
             continue
 
-    # Extract dicts
+    # Extract dict-like substring(s)
     matches = re.findall(r"{.*?}", repaired)
     for m in matches:
         try:
@@ -269,7 +282,7 @@ def extract_json_list(text: str) -> List[dict]:
         except:
             continue
 
-    # Aggressive repair for quotes / None / True / False
+    # Aggressive replacements for Python-like output
     aggressive = (
         repaired.replace("'", '"')
                 .replace("None", "null")
@@ -277,7 +290,6 @@ def extract_json_list(text: str) -> List[dict]:
                 .replace("False", "false")
     )
 
-    # Try lists again
     matches = re.findall(r"\[[^\]]*?\]", aggressive)
     for m in matches:
         try:
@@ -285,7 +297,6 @@ def extract_json_list(text: str) -> List[dict]:
         except:
             continue
 
-    # Try dicts again
     matches = re.findall(r"{.*?}", aggressive)
     for m in matches:
         try:
@@ -293,166 +304,120 @@ def extract_json_list(text: str) -> List[dict]:
         except:
             continue
 
-    # Fallback: extract between first [ and last ]
+    # Fallback: first '[' to last ']'
     try:
         start = aggressive.find("[")
         end = aggressive.rfind("]")
         if start != -1 and end != -1 and end > start:
-            segment = aggressive[start:end+1]
+            segment = aggressive[start:end + 1]
             return json.loads(segment)
     except:
         pass
-    
-    print('EMPTY')
+
+    print("EMPTY")
     return []
 
-def resolve_local_model_path(model_id: str, hf_home: str) -> str:
-    """
-    Map a HF model id to the local directory where we downloaded it.
-    Falls back to model_id if not found.
-    """
-    mapping = {
-        "meta-llama/Llama-3.1-8B-Instruct": os.path.join(hf_home, "models", "meta-llama__Llama-3.1-8B-Instruct"),
-        "Qwen/Qwen2.5-7B-Instruct":         os.path.join(hf_home, "models", "Qwen__Qwen2.5-7B-Instruct"),
-        "Qwen/Qwen2.5-14B-Instruct":        os.path.join(hf_home, "models", "Qwen__Qwen2.5-14B-Instruct"),
-    }
-    local = mapping.get(model_id, model_id)
-    # If it looks like a local path, validate it has config.json
-    if os.path.isdir(local):
-        cfg = os.path.join(local, "config.json")
-        if not os.path.exists(cfg):
-            raise RuntimeError(f"Local model dir exists but missing config.json: {local}")
-    return local
+
+# ============================================================
+# Model selection by language
+# ============================================================
 
 def get_model_name_for_language(language_code: str) -> str:
     """
-    Returns the Hugging Face model ID most appropriate for the given language.
-    
-    Strategy:
-    - Use language-specific fine-tunes for distinct scripts/grammars (Chinese, Japanese).
-    - Use Llama 3.1 (instead of 3.0) for Cyrillic languages (Russian, Ukrainian, Tatar) 
-      because 3.1 has significantly better multilingual pre-training.
-    - Default to Llama 3.1 for English (Best 8B model as of late 2024).
+    Map language code -> base HF model name.
     """
-    
-    # Normalize input just in case
     lang = language_code.lower().strip()
-
     model_map = {
-        # English: Llama 3.1 is superior to 3.0 for instruction following and JSON adherence.
         "eng": "meta-llama/Llama-3.1-8B-Instruct",
-
-        # Chinese: HFL (Hugging Face Library team) fine-tune. 
-        # Fixes English-bias issues and improves tokenizer for Hanzi.
         "zho": "Qwen/Qwen2.5-7B-Instruct",
-
-        # Japanese: ELYZA. The gold standard for Japanese Llama models.
         "jpn": "Qwen/Qwen2.5-14B-Instruct",
-
-        # Russian: Llama 3.1 is highly recommended over 3.0 for Cyrillic.
-        # You could also use "IlyaGusev/saiga_llama3_8b" if you prefer a chat-specific finetune.
         "rus": "Qwen/Qwen2.5-14B-Instruct",
-
-        # Ukrainian: Llama 3.1 has native support. 
-        # Alternatives: "UberText/Llama-3-8B-UA" (if available/verified), but 3.1 is safest base.
         "ukr": "Qwen/Qwen2.5-14B-Instruct",
-
-        # Tatar: Low-resource Cyrillic. 
-        # Llama 3.1 is the best foundation due to massive multilingual training data.
         "tat": "Qwen/Qwen2.5-14B-Instruct"
     }
-
-    # Default to English base if language not found
     return model_map.get(lang, "meta-llama/Llama-3.1-8B-Instruct")
 
-# --- Main Inference Function ---
+
+# ============================================================
+# Main inference function
+# ============================================================
+
 def main():
+    """
+    Main inference routine:
+      - build prompt file
+      - load model + adapter
+      - generate outputs in batches
+      - post-process and save JSONL
+    """
     parser = argparse.ArgumentParser(description="Run inference with a trained LoRA model.")
-    parser.add_argument('--domain', type=str, default='restaurant', help="Domain (e.g., 'restaurant', 'laptop')")
-    parser.add_argument('--language', type=str, default='tat', help="Language (e.g., 'eng')")
-    parser.add_argument('--subtask', type=str, default='subtask_2', help="Subtask (e.g., 'quad')")
-    parser.add_argument('--task', type=str, default='task2', help="Subtask (e.g., 'quad')")
-    parser.add_argument('--base_url', type=str, default=f"https://raw.githubusercontent.com/DimABSA/DimABSA2026/refs/heads/main/task-dataset/track_a", help="Base URL for data")
-    parser.add_argument('--batch_size', type=int, default=8, help="Batch size for inference")
-    parser.add_argument('--run_id', type=str, default='44qsgdj0', help="run_id to inference")
-    parser.add_argument(
-                    "--data_root",
-                    type=str,
-                    default="/leonardo_work/EUHPC_D19_014/dimABSA/data/track_a",
-                    help="Local root for track_a (offline). Layout: data_root/subtask/lang/*.jsonl",
-                )
-    
+    parser.add_argument('--domain', type=str, default='restaurant')
+    parser.add_argument('--language', type=str, default='tat')
+    parser.add_argument('--subtask', type=str, default='subtask_2')
+    parser.add_argument('--task', type=str, default='task2')
+    parser.add_argument('--base_url', type=str, default="https://raw.githubusercontent.com/DimABSA/DimABSA2026/refs/heads/main/task-dataset/track_a")
+    parser.add_argument('--batch_size', type=int, default=8)
     args = parser.parse_args()
 
-    # --- 1. Prepare Prediction Data ---
     print("--- Starting Data Preparation for Inference ---")
-    output_dir = f"/leonardo_work/EUHPC_D19_014/dimABSA/dimABSA/pure_llm/{args.subtask}/{args.run_id}/{args.language}"
+    output_dir = f"./{args.subtask}/{args.language}"
+
     predict_data_path = f"{output_dir}/{args.language}_{args.domain}_prediction_prompts.jsonl"
     output_file = f"{output_dir}/pred_{args.language}_{args.domain}.jsonl"
-    
+
     selected_model_name = get_model_name_for_language(args.language)
-
     sane_model_name = selected_model_name.replace("/", "_")
-    adapter_path = f"/leonardo_work/EUHPC_D19_014/dimABSA/dimABSA/pure_llm/{args.subtask}/{args.run_id}/final_models/{sane_model_name}_{args.language}_{args.domain}"
-    
-    predict_url = os.path.join(
-        args.data_root,
-        args.subtask,
-        args.language,
-        f"{args.language}_{args.domain}_dev_{args.task}.jsonl",
-    )
+    adapter_path = f"./models/{sane_model_name}_{args.language}_{args.domain}"
+
+    # Load data from URL:
+    predict_url = f"{args.base_url}/{args.subtask}/{args.language}/{args.language}_{args.domain}_dev_{args.task}.jsonl"
     print(f"Loading training data from: {predict_url}")
+    predict_raw = load_jsonl_url(predict_url)
 
-    with open(predict_url, "r", encoding="utf-8") as f:
-        predict_raw = [json.loads(line) for line in f if line.strip()]
-
+    # Build prompts jsonl
     convert_prediction_data(predict_raw, predict_data_path, selected_model_name, args.language, args.domain)
     print("--- Data Preparation Complete ---")
 
-    hf_home = os.environ.get("HF_HOME", "")
-    model_source = resolve_local_model_path(selected_model_name, hf_home) if hf_home else selected_model_name
-    print(f"Loading model from: {model_source}")
+    # Load tokenizer + base model
+    tokenizer = AutoTokenizer.from_pretrained(selected_model_name)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_source)
-
+    # Prefer torch_dtype instead of dtype for HF compatibility
     model = AutoModelForCausalLM.from_pretrained(
-        model_source,
-        dtype=torch.float16,
+        selected_model_name,
+        torch_dtype=torch.float16,
         device_map="auto"
     )
-    
-    tokenizer.pad_token = tokenizer.eos_token 
-    tokenizer.padding_side = "left" # Correct for batch generation
 
+    # Ensure padding works for batch generation
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # left padding is typical for decoder-only generation
+
+    # Load LoRA adapter weights
     print(f"\nLoading LoRA adapters from: {adapter_path}")
     model = PeftModel.from_pretrained(model, adapter_path)
     model.eval()
 
-    # --- 3. Load Prediction Prompts ---
+    # Load prompt file (intermediate)
     print(f"Loading test data from: {predict_data_path}")
     test_data = load_jsonl_file(predict_data_path)
 
-    final_submissions = []
-
-    # Tokenize just to get lengths
+    # Prepare batched prompts
     all_prompts = [x["prompt_text"] for x in test_data]
     all_ids = [x["ID"] for x in test_data]
     all_texts = [x["raw_text"] for x in test_data]
 
     prompt_lengths = [len(tokenizer(p, truncation=True)["input_ids"]) for p in all_prompts]
-
-    # Combine prompts, IDs, texts, and lengths
     examples = list(zip(all_prompts, all_ids, all_texts, prompt_lengths))
+    examples.sort(key=lambda x: x[3])  # sort by prompt length for efficiency
 
-    # Sort by length
-    examples.sort(key=lambda x: x[3])
-
-    # Now create batches
     batch_size = args.batch_size
-    batches = [examples[i:i+batch_size] for i in range(0, len(examples), batch_size)]
+    batches = [examples[i:i + batch_size] for i in range(0, len(examples), batch_size)]
 
-    # Inference loop
-    # Inference loop with progress bar
+    # ============================================================
+    # Generation loop
+    # ============================================================
+    final_submissions = []
+
     for batch in tqdm(batches, desc="Generating outputs"):
         batch_prompts = [x[0] for x in batch]
         batch_ids     = [x[1] for x in batch]
@@ -461,7 +426,7 @@ def main():
         inputs = tokenizer(
             text=batch_prompts,
             return_tensors="pt",
-            padding=True,          # minimal padding because lengths are similar
+            padding=True,
             truncation=True,
         ).to(model.device)
 
@@ -473,11 +438,10 @@ def main():
             use_cache=True
         )
 
-        # decode only generated portion
+        # Only decode the continuation (exclude prompt tokens)
         gen = output[:, inputs.input_ids.shape[1]:]
         batch_outputs = tokenizer.batch_decode(gen, skip_special_tokens=True)
 
-        # store temporarily for post-processing step
         for j, raw_output in enumerate(batch_outputs):
             final_submissions.append({
                 "id": batch_ids[j],
@@ -485,6 +449,9 @@ def main():
                 "raw_output": raw_output
             })
 
+    # ============================================================
+    # Post-processing: parse JSON + normalize spans + validate VA
+    # ============================================================
     processed = []
 
     for item in final_submissions:
@@ -506,13 +473,14 @@ def main():
 
             if aspect != "NULL":
                 aspect = get_original_span(raw_review_text, aspect)
-
             if opinion != "NULL":
                 opinion = get_original_span(raw_review_text, opinion)
 
+            # Skip if essential fields missing
             if aspect == "NULL" or opinion == "NULL":
                 continue
 
+            # Dedupe includes category, but you don't output category later (schema mismatch risk)
             key = (aspect, quad.get("Category"), opinion)
             if key in seen:
                 continue
@@ -521,13 +489,14 @@ def main():
             v = quad.get("Valence")
             a = quad.get("Arousal")
             va_str = "NULL#NULL"
-
             if isinstance(v, (int, float)) and isinstance(a, (int, float)):
                 if 1 <= v <= 9 and 1 <= a <= 9:
                     va_str = f"{v:.2f}#{a:.2f}"
 
+            # WARNING: Missing "Category" in output might break evaluator
             final_quads.append({
                 "Aspect": aspect,
+                # "Category": quad.get("Category"),  # Consider adding back
                 "Opinion": opinion,
                 "VA": va_str
             })
@@ -538,11 +507,12 @@ def main():
             "Triplet": final_quads
         })
 
-    # --- 7. Save ---
+    # Save results
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'w', encoding='utf-8') as f:
         for entry in processed:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
     print(f"\nInference complete! File: {output_file}")
 
 if __name__ == "__main__":
