@@ -1,0 +1,47 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# ---------- OS ----------
+.DS_Store
+Thumbs.db
+
+# ---------- Logs / tracking ----------
+*.log
+logs/
+wandb/
+runs/
+
+# ---------- Caches ----------
+**/.cache/
+.cache/
+huggingface/
+**/.huggingface/
+**/hf_cache/
+
+# ---------- Model artifacts (your structure) ----------
+DimASR/models/
+DimASTE/models/
+DimASQP/models/
+**/*-checkpoints/
+**/checkpoint-*/
+**/*.safetensors
+**/*.bin
+**/*.pt
+
+# ---------- Outputs / submissions (common) ----------
+outputs/
+predictions/
+submissions/
+**/pred_*.jsonl
+**/*_prediction_prompts.jsonl
+
+# If you want to ignore ALL JSONL outputs except prompt templates, use:
+# **/*.jsonl
+# !**/prompts*.jsonl
