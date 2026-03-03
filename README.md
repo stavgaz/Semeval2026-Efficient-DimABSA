@@ -54,12 +54,12 @@ pip install unsloth
 ## Example Runs
 
 
-# 0) (Optional) login for gated models like Llama
+### 0) (Optional) login for gated models like Llama
 ```bash
 huggingface-cli login
 ```
 
-# 1) Train LoRA (example: subtask_2, Tatar, restaurant)
+### 1) Train LoRA (example: subtask_2, Tatar, restaurant)
 ```bash
 python DimASTE/Training.py \
   --subtask subtask_2 \
@@ -71,7 +71,7 @@ python DimASTE/Training.py \
   --lr 2e-4
 ```
 
-# 2) Run inference (generates predictions JSONL)
+### 2) Run inference (generates predictions JSONL)
 ```bash
 python DimASTE/Inference.py \
   --subtask subtask_2 \
