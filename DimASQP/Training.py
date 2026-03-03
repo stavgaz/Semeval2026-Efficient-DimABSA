@@ -1,17 +1,25 @@
-# --- 1. IMPORT UNSLOTH FIRST (REQUIRED) ---
+# ============================================================
+# 1) IMPORT UNSLOTH FIRST (REQUIRED)
+# ============================================================
 from unsloth import FastLanguageModel
 
-# --- 2. IMPORT TRL SFTTrainer (THE CLASS TO PATCH) ---
+# ============================================================
+# 2) IMPORT TRL SFTTrainer (CLASS TO PATCH)
+# ============================================================
 from trl.trainer.sft_trainer import SFTTrainer
 
-# --- 3. PATCH TRL'S DEFAULT EOS BEFORE ANY TRAINER IS CREATED ---
+# ============================================================
+# 3) PATCH TRL'S DEFAULT EOS BEFORE ANY TRAINER IS CREATED
+# ============================================================
 SFTTrainer.default_eos_token = "<|eot_id|>"
 SFTTrainer.default_eos_token_id = 128009
 
 print("TRL DEFAULT EOS TOKEN:", SFTTrainer.default_eos_token)
 print("TRL DEFAULT EOS TOKEN ID:", SFTTrainer.default_eos_token_id)
 
-# --- 4. NOW IMPORT THE REST OF YOUR DEPENDENCIES ---
+# ============================================================
+# 4) NOW IMPORT THE REST OF YOUR DEPENDENCIES
+# ============================================================
 import json
 import requests
 import argparse
@@ -23,7 +31,6 @@ import torch
 import math
 import logging
 from typing import List, Dict, Set, Tuple, Any
-import wandb
 
 from transformers import (
     AutoModelForCausalLM,
@@ -39,33 +46,52 @@ from peft import (
     PeftModel,
 )
 
-# --- 5. IMPORTANT: NOW SAFE TO IMPORT TRL CONFIG ---
+# ============================================================
+# 5) IMPORTANT: NOW SAFE TO IMPORT TRL CONFIG
+# ============================================================
 from trl import SFTConfig
 
 from datasets import load_dataset
 from tqdm import tqdm
 
 
-# --- (All category definitions, set_seed, load_jsonl_url are the same) ---
+# ============================================================
+# Category construction helpers
+# ============================================================
+
 def combine_lists(list1, list2):
+    """
+    Create all combinations "<ENTITY>#<ATTRIBUTE>" for labeling.
+
+    Returns:
+      - result_dict: map from category string -> index
+      - combinations: list of category strings in index order
+    """
     combinations = [f"{s1}#{s2}" for s1 in list1 for s2 in list2]
     result_dict = {}
     for index, combo in enumerate(combinations):
         result_dict[combo] = index
     return result_dict, combinations
 
+
+# Domain-specific label spaces
 laptop_entity_labels = ['LAPTOP', 'DISPLAY', 'KEYBOARD', 'MOUSE', 'MOTHERBOARD', 'CPU', 'FANS_COOLING', 'PORTS', 'MEMORY', 'POWER_SUPPLY', 'OPTICAL_DRIVES', 'BATTERY', 'GRAPHICS', 'HARD_DISK', 'MULTIMEDIA_DEVICES', 'HARDWARE', 'SOFTWARE', 'OS', 'WARRANTY', 'SHIPPING', 'SUPPORT', 'COMPANY'] + ['OUT_OF_SCOPE']
 laptop_attribute_labels = ['GENERAL', 'PRICE', 'QUALITY', 'DESIGN_FEATURES', 'OPERATION_PERFORMANCE', 'USABILITY', 'PORTABILITY', 'CONNECTIVITY', 'MISCELLANEOUS']
 laptop_category_dict, laptop_category_list = combine_lists(laptop_entity_labels, laptop_attribute_labels)
+
 restaurant_entity_labels = ['RESTAURANT', 'FOOD', 'DRINKS', 'AMBIENCE', 'SERVICE', 'LOCATION']
 restaurant_attribute_labels= ['GENERAL', 'PRICES', 'QUALITY', 'STYLE_OPTIONS', 'MISCELLANEOUS']
 restaurant_category_dict, restaurant_category_list = combine_lists(restaurant_entity_labels, restaurant_attribute_labels)
+
 hotel_entity_labels = ['HOTEL', 'ROOMS', 'FACILITIES', 'ROOM_AMENITIES', 'SERVICE', 'LOCATION', 'FOOD_DRINKS']
 hotel_attribute_labels = ['GENERAL', 'PRICE', 'COMFORT', 'CLEANLINESS', 'QUALITY', 'DESIGN_FEATURES', 'STYLE_OPTIONS', 'MISCELLANEOUS']
 hotel_category_dict, hotel_category_list = combine_lists(hotel_entity_labels, hotel_attribute_labels)
+
 finance_entity_labels = ['MARKET', 'COMPANY', 'BUSINESS', 'PRODUCT']
 finance_attribute_labels = ['GENERAL', 'SALES', 'PROFIT', 'AMOUNT', 'PRICE', 'COST']
 finance_category_dict, finance_category_list = combine_lists(finance_entity_labels, finance_attribute_labels)
+
+# Quick access maps
 category_map = {
     'lap': (laptop_category_dict, laptop_category_list),
     'res': (restaurant_category_dict, restaurant_category_list),
@@ -79,48 +105,85 @@ domain_mapping = {
     'finance': 'fin'
 }
 
+# ============================================================
+# Reproducibility
+# ============================================================
+
 def set_seed(seed: int):
+    """
+    Set Python/NumPy/PyTorch RNG seeds for reproducibility.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+# ============================================================
+# Data loading helpers
+# ============================================================
+
 def load_jsonl_url(url: str) -> List[Dict]:
+    """
+    Download JSONL from a URL and parse each line as JSON.
+    """
     resp = requests.get(url)
     resp.raise_for_status()
     return [json.loads(line) for line in resp.text.splitlines()]
 
-def convert_data(raw_data: List[Dict], category_list: List[str], output_file: str, model_name: str, language: str = "eng", domain: str = "res", is_prediction: bool = False):
+# ============================================================
+# Data conversion (build SFT training text)
+# ============================================================
+
+def convert_data(
+    raw_data: List[Dict],
+    category_list: List[str],
+    output_file: str,
+    model_name: str,
+    language: str = "eng",
+    domain: str = "res",
+    is_prediction: bool = False
+):
     """
-    Converts data using the new strategy (separate Valence/Arousal keys).
-    Supports multilingual data (Chinese, Japanese, Cyrillic) via ensure_ascii=False.
+    Convert raw dataset entries into a JSONL where each line is:
+      {"text": "<FULL TRAINING PROMPT + ANSWER>"}
+
+    NOTE: `is_prediction` is unused here; you might remove it or implement branching.
     """
     new_dataset = []
     for data_sample in raw_data:
         try:
-            # TRAINING: Full prompt + answer
-            prompt_string = create_new_instruction_prompt(data_sample, category_list, model_name, language, domain)
-            new_dataset.append({
-                "text": prompt_string
-            })
-        except KeyError as e:
-            pass 
+            # Build the full supervised training string (prompt + gold JSON answer)
+            prompt_string = create_new_instruction_prompt(
+                data_sample, category_list, model_name, language, domain
+            )
+            new_dataset.append({"text": prompt_string})
+        except KeyError:
+            # Missing expected fields (e.g., Text or Quadruplet)
+            pass
         except Exception as e:
             print(f"Error processing sample: {e}\nSample ID: {data_sample.get('ID', 'Unknown')}")
-    
+
+    # Make sure directory exists
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    
-    # CRITICAL: ensure_ascii=False prevents Chinese/Russian from turning into \uXXXX garbage
+
+    # ensure_ascii=False keeps multilingual readable instead of \uXXXX escapes
     with open(output_file, 'w', encoding='utf-8') as f:
         for item in new_dataset:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
-            
+
     print(f"Data conversion complete! File saved to {output_file}.")
     print(f"Total prompts generated: {len(new_dataset)}")
 
+# ============================================================
+# Prompt template loading
+# ============================================================
+
 def load_prompt(lang, domain, categories, is_train=True):
-    with open("/leonardo_work/EUHPC_D19_014/dimABSA/dimABSA/prompts.jsonl", "r") as f:
+    """
+    Load per-language/domain prompt templates and inject categories.
+    """
+    with open("./prompts.jsonl", "r") as f:
         prompts = json.load(f)
 
     key = f"{lang}_{domain}"
@@ -132,21 +195,32 @@ def load_prompt(lang, domain, categories, is_train=True):
         prompt = p["infer_prompt"].replace("{CATEGORIES}", str(categories))
     return prompt
 
-# --- START: MODIFIED PROMPT FUNCTION (Added V/A Definitions) ---
-def create_new_instruction_prompt(data_sample: Dict, category_list: List[str], model_name: str, language: str = "eng", domain: str = 'res') -> str:
+# ============================================================
+# Prompt builder (supervised: prompt + answer JSON)
+# ============================================================
+
+def create_new_instruction_prompt(
+    data_sample: Dict,
+    category_list: List[str],
+    model_name: str,
+    language: str = "eng",
+    domain: str = 'res'
+) -> str:
     """
-    Creates a formatted prompt string for prediction (no answer).
-    Supports multilingual instructions via the 'language' parameter.
-    Languages: 'eng', 'zho', 'jpn', 'rus', 'tat', 'ukr'.
+    Build the full SFT training sample:
+      <chat prompt> + <gold JSON answer>
+
+    Gold answer format:
+      [
+        {"Aspect": ..., "Category": ..., "Opinion": ..., "Valence": float, "Arousal": float},
+        ...
+      ]
     """
-    
-    # 1. Format the category list string to be used in the f-strings below
+    # 1) Allowed categories inserted into instruction
     possible_categories = ", ".join(f'"{cat}"' for cat in category_list)
-    
-    # 2. Get the instruction based on language (Default to English 'eng' if not found)
     instruction = load_prompt(language, domain, possible_categories)
-    
-    # 3. Parse the old "V#A" format and build the new-format "answer" JSON
+
+    # 2) Convert old "VA": "V#A" string into separate floats Valence/Arousal
     new_quad_list = []
     for quad in data_sample['Quadruplet']:
         try:
@@ -154,8 +228,9 @@ def create_new_instruction_prompt(data_sample: Dict, category_list: List[str], m
             v = float(v_str)
             a = float(a_str)
         except (ValueError, TypeError, AttributeError):
-            v, a = 5.00, 5.00 # Fallback on error
-            
+            # Fallback if missing/bad format
+            v, a = 5.00, 5.00
+
         new_quad_list.append({
             "Aspect": quad.get("Aspect"),
             "Category": quad.get("Category"),
@@ -164,28 +239,27 @@ def create_new_instruction_prompt(data_sample: Dict, category_list: List[str], m
             "Arousal": a
         })
 
-    # `indent=2` makes the training data human-readable and helps the model learn the structure
+    # Indented JSON can help the model learn structure
     answer_json_string = json.dumps(new_quad_list, indent=2, ensure_ascii=False)
 
+    # Force 1-decimal floats to 2 decimals (e.g., 5.0 -> 5.00)
     answer_json_string = re.sub(
-        r'("(?:Valence|Arousal)":\s*)(\d+\.\d)(?!\d)', 
-        r'\g<1>\g<2>0', 
+        r'("(?:Valence|Arousal)":\s*)(\d+\.\d)(?!\d)',
+        r'\g<1>\g<2>0',
         answer_json_string
     )
-    
-    # Matches: "Key": 5 -> "Key": 5.00 (Just in case integer slipped through)
+    # Force ints to 2-decimal floats (e.g., 5 -> 5.00)
     answer_json_string = re.sub(
-        r'("(?:Valence|Arousal)":\s*)(\d+)(?!\d|\.)', 
-        r'\g<1>\g<2>.00', 
+        r'("(?:Valence|Arousal)":\s*)(\d+)(?!\d|\.)',
+        r'\g<1>\g<2>.00',
         answer_json_string
     )
 
-    # 3. Get the review text
+    # 3) Review text
     text = data_sample['Text'].replace("` ` ", "")
-    
-    # 4. Create the final, full prompt string
-    if "llama" in model_name.lower():
 
+    # 4) Wrap into the model-specific chat format
+    if "llama" in model_name.lower():
         if language == 'eng':
             prompt = f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
 
@@ -197,7 +271,6 @@ Review: \"{text}\"<|eot_id|>
 {answer_json_string}<|eot_id|>"""
 
     if "qwen" in model_name.lower():
-
         if language == 'eng':
             prompt = f"""<|im_start|>user
 {instruction}
@@ -207,7 +280,6 @@ Review: \"{text}\"
 <|im_start|>assistant
 {answer_json_string}
 <|im_end|>"""
-            
         if language == 'ukr':
             prompt = f"""<|im_start|>user
 {instruction}
@@ -226,7 +298,6 @@ Review: \"{text}\"
 <|im_start|>assistant
 {answer_json_string}
 <|im_end|>"""
-
         elif language == 'zho':
             prompt = f"""<|im_start|>user
 {instruction}
@@ -236,7 +307,6 @@ Review: \"{text}\"
 <|im_start|>assistant
 {answer_json_string}
 <|im_end|>"""
-
         elif language == 'jpn':
             prompt = f"""<|im_start|>user
 {instruction}
@@ -246,7 +316,6 @@ Review: \"{text}\"
 <|im_start|>assistant
 {answer_json_string}
 <|im_end|>"""
-
         elif language == 'rus':
             prompt = f"""<|im_start|>user
 {instruction}
@@ -258,77 +327,49 @@ Review: \"{text}\"
 <|im_end|>"""
 
     return prompt
-    
 
-def resolve_local_model_path(model_id: str, hf_home: str) -> str:
-    """
-    Map a HF model id to the local directory where we downloaded it.
-    Falls back to model_id if not found.
-    """
-    mapping = {
-        "meta-llama/Llama-3.1-8B-Instruct": os.path.join(hf_home, "models", "meta-llama__Llama-3.1-8B-Instruct"),
-        "Qwen/Qwen2.5-7B-Instruct":         os.path.join(hf_home, "models", "Qwen__Qwen2.5-7B-Instruct"),
-        "Qwen/Qwen2.5-14B-Instruct":        os.path.join(hf_home, "models", "Qwen__Qwen2.5-14B-Instruct"),
-    }
-    local = mapping.get(model_id, model_id)
-    # If it looks like a local path, validate it has config.json
-    if os.path.isdir(local):
-        cfg = os.path.join(local, "config.json")
-        if not os.path.exists(cfg):
-            raise RuntimeError(f"Local model dir exists but missing config.json: {local}")
-    return local
+# ============================================================
+# Model selection by language
+# ============================================================
 
 def get_model_name_for_language(language_code: str) -> str:
     """
-    Returns the Hugging Face model ID most appropriate for the given language.
-    
-    Strategy:
-    - Use language-specific fine-tunes for distinct scripts/grammars (Chinese, Japanese).
-    - Use Llama 3.1 (instead of 3.0) for Cyrillic languages (Russian, Ukrainian, Tatar) 
-      because 3.1 has significantly better multilingual pre-training.
-    - Default to Llama 3.1 for English (Best 8B model as of late 2024).
+    Choose base HF model per language.
     """
-    
-    # Normalize input just in case
     lang = language_code.lower().strip()
-
     model_map = {
-        # English: Llama 3.1 is superior to 3.0 for instruction following and JSON adherence.
         "eng": "meta-llama/Llama-3.1-8B-Instruct",
-
-        # Chinese: HFL (Hugging Face Library team) fine-tune. 
-        # Fixes English-bias issues and improves tokenizer for Hanzi.
         "zho": "Qwen/Qwen2.5-7B-Instruct",
-
-        # Japanese: ELYZA. The gold standard for Japanese Llama models.
         "jpn": "Qwen/Qwen2.5-14B-Instruct",
-
-        # Russian: Llama 3.1 is highly recommended over 3.0 for Cyrillic.
-        # You could also use "IlyaGusev/saiga_llama3_8b" if you prefer a chat-specific finetune.
         "rus": "Qwen/Qwen2.5-14B-Instruct",
-
-        # Ukrainian: Llama 3.1 has native support. 
-        # Alternatives: "UberText/Llama-3-8B-UA" (if available/verified), but 3.1 is safest base.
         "ukr": "Qwen/Qwen2.5-14B-Instruct",
-
-        # Tatar: Low-resource Cyrillic. 
-        # Llama 3.1 is the best foundation due to massive multilingual training data.
         "tat": "Qwen/Qwen2.5-14B-Instruct"
     }
-
-    # Default to English base if language not found
     return model_map.get(lang, "meta-llama/Llama-3.1-8B-Instruct")
 
-# --- Main Training Function ---
+# ============================================================
+# Main training entry
+# ============================================================
+
 def main():
+    """
+    Pipeline:
+      1) Parse args
+      2) Download raw training JSONL
+      3) Convert to TRL SFT JSONL with {"text": "..."}
+      4) Load dataset
+      5) Load base model 4-bit with Unsloth
+      6) Attach LoRA
+      7) Train with TRL SFTTrainer
+      8) Save adapter weights
+    """
     parser = argparse.ArgumentParser(description="Train a LoRA model.")
-    # (All parser arguments are the same)
     parser.add_argument('--domain', type=str, default='restaurant', help="Domain")
     parser.add_argument('--language', type=str, default='zho', help="Language")
     parser.add_argument('--subtask', type=str, default='subtask_3', help="Subtask")
-    parser.add_argument('--base_url', type=str, default=f"https://cdn.jsdelivr.net/gh/DimABSA/DimABSA2026@main/task-dataset/track_a/", help="Base URL for data")
+    parser.add_argument('--base_url', type=str, default="https://cdn.jsdelivr.net/gh/DimABSA/DimABSA2026@main/task-dataset/track_a/", help="Base URL for data")
     parser.add_argument('--seed', type=int, default=42, help="Random seed")
-    parser.add_argument('--epochs', type=int, default=0.5, help="Max number of training epochs")
+    parser.add_argument('--epochs', type=int, default=1, help="Max number of training epochs")
     parser.add_argument('--batch_size', type=int, default=2, help="Per-device batch size")
     parser.add_argument('--grad_accum', type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument('--lr', type=float, default=2e-4, help="Learning rate")
@@ -339,91 +380,87 @@ def main():
     parser.add_argument('--lora_alpha', type=int, default=32, help="LoRA alpha")
     parser.add_argument('--lora_dropout', type=float, default=0.2, help="LoRA dropout")
     parser.add_argument('--lora_target_modules', nargs='+', default=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"], help="LoRA target modules")
-    parser.add_argument(
-                    "--data_root",
-                    type=str,
-                    default="/leonardo_work/EUHPC_D19_014/dimABSA/data/track_a",
-                    help="Local root for track_a (offline). Layout: data_root/subtask/lang/*.jsonl",
-                )
     args = parser.parse_args()
 
-    run = wandb.init(project="llms", config=args)
-
-    global tokenizer
-    
-    # --- 1. Set Seed ---
+    # --- 1) Set Seed ---
     set_seed(args.seed)
     print(f"Set random seed to {args.seed}")
 
-    # --- 2. Prepare Data ---
+    # --- 2) Prepare Data ---
     print("--- Starting Data Preparation ---")
+
+    # Map full domain name -> short domain key used in category_map
     domain_key = domain_mapping.get(args.domain, args.domain)
     categories_for_this_domain = category_map[domain_key][1]
-    output_dir = f"/leonardo_work/EUHPC_D19_014/dimABSA/dimABSA/pure_llm/{args.subtask}/{run.id}/{args.language}"
+
+    output_dir = f"./{args.subtask}/{args.language}"
+
     train_output_path = f"{output_dir}/{args.language}_{args.domain}_train_prompts.jsonl"
-    train_path = os.path.join(
-        args.data_root,
-        args.subtask,
-        args.language,
-        f"{args.language}_{args.domain}_train_alltasks.jsonl",
-    )
-    print(f"Loading training data from: {train_path}")
 
-    with open(train_path, "r", encoding="utf-8") as f:
-        train_raw = [json.loads(line) for line in f if line.strip()]
+    # Remote JSONL URL for training
+    train_url = f"{args.base_url}/{args.subtask}/{args.language}/{args.language}_{args.domain}_train_alltasks.jsonl"
+    print(f"Downloading training data from: {train_url}")
+    train_raw = load_jsonl_url(train_url)
 
+    # Shuffle to reduce ordering bias
     random.shuffle(train_raw)
 
+    # Compute warmup steps (rough estimate; ignores remainder and multi-GPU nuances)
     num_update_steps_per_epoch = len(train_raw) // (args.batch_size * args.grad_accum)
     total_training_steps = num_update_steps_per_epoch * args.epochs
     num_warmup_steps = int(total_training_steps * args.warmup_ratio)
     print(f"Total training steps: {total_training_steps}, Warmup steps: {num_warmup_steps}")
-    
+
+    # Choose model based on language
     selected_model_name = get_model_name_for_language(args.language)
-    wandb.config["model_name"] = selected_model_name
-    
-    convert_data(train_raw, categories_for_this_domain, train_output_path, selected_model_name, args.language, args.domain, is_prediction=False)
+
+    # Convert raw samples -> SFT JSONL: {"text": "<prompt+answer>"}
+    convert_data(
+        train_raw,
+        categories_for_this_domain,
+        train_output_path,
+        selected_model_name,
+        args.language,
+        args.domain,
+        is_prediction=False
+    )
     print("--- Data Preparation Complete ---")
-    
-    # --- 3. Load Datasets ---
+
+    # --- 3) Load Dataset ---
+    # Loads the JSONL where each record has field "text"
     train_dataset = load_dataset('json', data_files=train_output_path, split='train')
 
-    hf_home = os.environ.get("HF_HOME", "")
-    model_source = resolve_local_model_path(selected_model_name, hf_home) if hf_home else selected_model_name
-    print(f"Loading model from: {model_source}")
-
-    # --- 4. Model & Tokenizer Setup (4-BIT) ---
+    # --- 4) Model & Tokenizer Setup (4-BIT) ---
+    # Uses Unsloth's fast loader, optionally quantized.
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = model_source,
-        max_seq_length = 2048, # Reduce this if you still OOM (e.g., to 2048)
-        dtype = None,          # Auto-detects your GPU's best dtype
-        load_in_4bit = True,   # Forces 4-bit to fit in 48GB
-        local_files_only = True,
+        model_name=selected_model_name,
+        max_seq_length=2048,
+        dtype=None,          # Auto-select dtype
+        load_in_4bit=True,   # 4-bit quantization
     )
 
-    # 2. Add LoRA adapters (Unsloth handles the config internally)
+    # --- 5) Add LoRA adapters ---
+    # Unsloth wraps PEFT under the hood.
     model = FastLanguageModel.get_peft_model(
         model,
-        r = args.lora_r,
-        target_modules = args.lora_target_modules,
-        lora_alpha = args.lora_alpha,
-        lora_dropout = args.lora_dropout, # Unsloth recommends 0 for speed
-        bias = "none",
+        r=args.lora_r,
+        target_modules=args.lora_target_modules,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,  # Unsloth often recommends 0.0 for speed/stability
+        bias="none",
     )
 
-    # Ensure pad token exists
+    # Ensure padding is defined for batching
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
     tokenizer.padding_side = "right"
 
-    # --- 6. Training ---
-    print("Setting up training arguments...")
-    
+    # --- 6) Training setup ---
     sane_model_name = selected_model_name.replace("/", "_")
-    model_output_dir = f"/leonardo_work/EUHPC_D19_014/dimABSA/dimABSA/pure_llm/{args.subtask}/{run.id}/final_models/{sane_model_name}_{args.language}_{args.domain}"
+    model_output_dir = f"./models/{sane_model_name}_{args.language}_{args.domain}"
     print(f"Model output directory: {model_output_dir}")
-    
+
+    # WARNING: bf16=True may crash on GPUs without bf16 support.
     training_args = SFTConfig(
         output_dir=f"{model_output_dir}-checkpoints",
         num_train_epochs=args.epochs,
@@ -433,18 +470,17 @@ def main():
         logging_steps=10,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
-        bf16=True,
+        bf16=True,          # switch to fp16=True if bf16 not supported
         max_grad_norm=0.3,
         max_steps=-1,
         warmup_steps=num_warmup_steps,
         lr_scheduler_type=args.lr_scheduler_type,
-        report_to="wandb",
         save_strategy="steps",
         save_total_limit=1,
-
         dataset_text_field="text",
     )
 
+    # Create trainer
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -452,17 +488,19 @@ def main():
         args=training_args,
     )
 
+    # Shows how many parameters are trainable (LoRA layers)
     print("\nTrainable parameters (BEFORE training):")
     trainer.model.print_trainable_parameters()
 
+    # --- 7) Train ---
     print("\n--- Starting Training ---")
     trainer.train()
     print("--- Training Complete ---")
 
-    print(f"Saving best model (based on eval_loss) to {model_output_dir}")
+    # --- 8) Save LoRA adapters ---
+    print(f"Saving model adapters to {model_output_dir}")
     trainer.model.save_pretrained(model_output_dir)
-    print(f"Best model adapters saved to {model_output_dir}")
-    
+    print(f"Adapters saved to {model_output_dir}")
 
 if __name__ == "__main__":
     main()
