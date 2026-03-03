@@ -47,7 +47,7 @@ pip install -U pip
 pip install torch --index-url https://download.pytorch.org/whl/cu121   # pick your CUDA
 pip install transformers datasets accelerate peft trl bitsandbytes tqdm numpy requests wandb
 pip install unsloth
-
+```
 
 ---
 
@@ -55,9 +55,12 @@ pip install unsloth
 
 
 # 0) (Optional) login for gated models like Llama
+```bash
 huggingface-cli login
+```
 
 # 1) Train LoRA (example: subtask_2, Tatar, restaurant)
+```bash
 python DimASTE/Training.py \
   --subtask subtask_2 \
   --language tat \
@@ -66,10 +69,14 @@ python DimASTE/Training.py \
   --batch_size 2 \
   --grad_accum 4 \
   --lr 2e-4
+```
 
 # 2) Run inference (generates predictions JSONL)
+```bash
 python DimASTE/Inference.py \
   --subtask subtask_2 \
   --language tat \
-  --domain restaurant \
+  --domain restaurant
   --batch_size 8
+```
+---
