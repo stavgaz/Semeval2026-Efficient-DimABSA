@@ -181,7 +181,7 @@ if __name__ == "__main__":
     # Output file path
     output = f"./translated_{args.language}_{args.domain}_final.jsonl"
 
-    # Input training file path (local dataset)
+    # Input training 
     train_url = f"{args.base_url}/{args.subtask}/{args.language}/{args.language}_{args.domain}_train_alltasks.jsonl"
     print(f"Loading training data from: {train_url}")
 
