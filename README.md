@@ -10,6 +10,10 @@ Our approach combines:
 - **Encoder fine-tuning** for VA regression (DimASR)
 - **Instruction-tuned LLM generation with LoRA** for structured JSON extraction (DimASTE/DimASQP)
 
+```markdown
+Paper: https://arxiv.org/abs/2603.04933
+```
+
 If you use this code, please cite:
 
 ```bibtex
