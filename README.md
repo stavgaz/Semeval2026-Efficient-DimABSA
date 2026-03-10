@@ -1,4 +1,4 @@
-# SemEval-2026 Task 3 (Track A) — Efficient DimABSA (AILS-NTUA)
+# AILS-NTUA at SemEval-2026 Task 3: Efficient Dimensional Aspect-Based Sentiment Analysis
 
 Code for our AILS-NTUA submission to **SemEval-2026 Task 3: Dimensional Aspect-Based Sentiment Analysis (DimABSA), Track-A**, covering:
 
