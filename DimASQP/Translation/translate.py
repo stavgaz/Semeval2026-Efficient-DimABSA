@@ -175,13 +175,14 @@ if __name__ == "__main__":
     parser.add_argument("--subtask", default="subtask_3")
     parser.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct")
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument('--base_url', type=str, default="https://cdn.jsdelivr.net/gh/DimABSA/DimABSA2026@main/task-dataset/track_a/", help="Base URL for data")
     args = parser.parse_args()
 
     # Output file path
     output = f"./translated_{args.language}_{args.domain}_final.jsonl"
 
     # Input training file path (local dataset)
-    train_url = f""
+    train_url = f"{args.base_url}/{args.subtask}/{args.language}/{args.language}_{args.domain}_train_alltasks.jsonl"
     print(f"Loading training data from: {train_url}")
 
     train_raw = read_jsonl_from_url(train_url)
@@ -243,10 +244,17 @@ if __name__ == "__main__":
                     print(f"[WARN] Batch {batch_idx}: invalid JSON (attempt {attempt+1})")
                     time.sleep(1)
                     continue
-
-                # Potential issue: if model returns a different number of objects,
-                # zip will silently drop extras. Your key-check below helps catch mismatch,
-                # but length mismatch could still cause partial loss.
+                    
+                if not isinstance(parsed, list):
+                    print(f"[WARN] Batch {batch_idx}: expected a JSON list but got {type(parsed).__name__} (attempt {attempt+1})")
+                    time.sleep(1)
+                    continue
+                
+                if len(parsed) != len(batch):
+                    print(f"[WARN] Batch {batch_idx}: length mismatch. input={len(batch)} output={len(parsed)} (attempt {attempt+1})")
+                    time.sleep(1)
+                    continue
+                    
                 for out_obj, orig_id in zip(parsed, ids):
                     out_obj[ID_FIELD] = orig_id
 
