@@ -1,16 +1,23 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import json
 import argparse
 import unicodedata
 from typing import List, Dict, Any, Optional
 
+import requests
 import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
+# -----------------------------
+# JSONL loader (URL)
+# -----------------------------
+def read_jsonl_from_url(url: str) -> List[Dict[str, Any]]:
+    """Download JSONL from a URL and parse each line as JSON."""
+    resp = requests.get(url)
+    resp.raise_for_status()
+    return [json.loads(line) for line in resp.text.splitlines()]
 
 
 # -----------------------------
@@ -25,7 +32,6 @@ def extract_json(text: str) -> Optional[Any]:
         return None
 
     text = text.strip()
-    # Find first '{' or '['
     candidates = [i for i in (text.find("{"), text.find("[")) if i != -1]
     if not candidates:
         return None
@@ -37,12 +43,11 @@ def extract_json(text: str) -> Optional[Any]:
         if c in "{[":
             stack.append(c)
         elif c in "}]":
-            # Guard against malformed closing brackets
             if not stack:
                 return None
             stack.pop()
             if not stack:
-                snippet = text[start : i + 1]
+                snippet = text[start: i + 1]
                 try:
                     return json.loads(snippet)
                 except Exception:
@@ -54,6 +59,7 @@ def extract_json(text: str) -> Optional[Any]:
 # Span matcher (your original, kept)
 # -----------------------------
 def get_original_span(full_text: str, predicted_span: Any) -> str:
+    """Map model-chosen span back to an exact substring in the original text."""
     if predicted_span is None:
         return ""
 
@@ -63,7 +69,6 @@ def get_original_span(full_text: str, predicted_span: Any) -> str:
     if not full_text:
         return predicted_span
 
-    # 1) Exact match
     if predicted_span in full_text:
         return predicted_span
 
@@ -93,16 +98,21 @@ def get_original_span(full_text: str, predicted_span: Any) -> str:
             current += 1
 
         if start_real != -1 and end_real != -1:
-            return full_text[start_real : end_real + 1]
+            return full_text[start_real: end_real + 1]
 
-    # Fallback: return original prediction (NOT None)
     return predicted_span
 
 
 # -----------------------------
-# Prompt builder (FIXED)
+# Prompt builder
 # -----------------------------
 def build_prompt(item: Dict[str, Any], language: str) -> str:
+    """
+    Given:
+      - src_text: original non-English review text
+      - quad: English quadruplet (Aspect/Opinion/Category/VA)
+    Ask the model to pick the best matching spans from the original text.
+    """
     lang_map = {
         "rus": "Russian",
         "tat": "Tatar",
@@ -112,7 +122,6 @@ def build_prompt(item: Dict[str, Any], language: str) -> str:
     }
     p = lang_map.get(language, language)
 
-    # NOTE: Keep it very explicit, and isolate the JSON.
     return (
         f"You are given a {p} review text and an English ABSA quadruplet.\n"
         f"Your task is to SELECT the closest matching spans from the ORIGINAL {p} text by MEANING.\n\n"
@@ -133,31 +142,9 @@ def build_prompt(item: Dict[str, Any], language: str) -> str:
         "Return JSON now:\n"
     )
 
-# -----------------------------
-# Model path resolver (your original idea, kept)
-# -----------------------------
-def resolve_local_model_path(model_id: str, hf_home: str) -> str:
-    mapping = {
-        "meta-llama/Llama-3.1-8B-Instruct": os.path.join(
-            hf_home, "models", "meta-llama__Llama-3.1-8B-Instruct"
-        ),
-        "Qwen/Qwen2.5-7B-Instruct": os.path.join(
-            hf_home, "models", "Qwen__Qwen2.5-7B-Instruct"
-        ),
-        "Qwen/Qwen2.5-14B-Instruct": os.path.join(
-            hf_home, "models", "Qwen__Qwen2.5-14B-Instruct"
-        ),
-    }
-    local = mapping.get(model_id, model_id)
-    if os.path.isdir(local):
-        cfg = os.path.join(local, "config.json")
-        if not os.path.exists(cfg):
-            raise RuntimeError(f"Local model dir exists but missing config.json: {local}")
-    return local
-
 
 # -----------------------------
-# Generation (renamed; not "ollama")
+# Generation
 # -----------------------------
 @torch.inference_mode()
 def model_generate_json(
@@ -166,6 +153,7 @@ def model_generate_json(
     model: AutoModelForCausalLM,
     max_new_tokens: int = 256,
 ) -> str:
+    """Generate text continuation from prompt and return decoded string."""
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     output_ids = model.generate(
         **inputs,
@@ -175,8 +163,7 @@ def model_generate_json(
         do_sample=False,
         pad_token_id=tokenizer.eos_token_id,
     )
-
-    generated = output_ids[0][inputs["input_ids"].shape[-1] :]
+    generated = output_ids[0][inputs["input_ids"].shape[-1]:]
     return tokenizer.decode(generated, skip_special_tokens=True).strip()
 
 
@@ -189,41 +176,34 @@ def main() -> None:
     parser.add_argument("--domain", default="restaurant")
     parser.add_argument("--subtask", default="subtask_3")
     parser.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct")
-    parser.add_argument("--batch_size", type=int, default=1)  # kept, but unused
-    parser.add_argument("--run_id", type=str, default="du19n6qg", help="run_id to inference")
-    parser.add_argument(
-        "--data_root",
-        type=str,
-        default="/leonardo_work/EUHPC_D19_014/dimABSA/data/track_a",
-        help="Local root for track_a (offline). Layout: data_root/subtask/lang/*.jsonl",
-    )
+    parser.add_argument("--batch_size", type=int, default=1)  # kept, but not used (per-item loop)
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--verbose_errors", action="store_true")
+    parser.add_argument(
+        "--base_url",
+        type=str,
+        default="https://cdn.jsdelivr.net/gh/DimABSA/DimABSA2026@main/task-dataset/track_a/",
+        help="Base URL for track_a JSONL",
+    )
     args = parser.parse_args()
 
-    output_path = (
-        f"/leonardo_work/EUHPC_D19_014/dimABSA/dimABSA/trans_res/"
-        f"{args.subtask}/{args.run_id}/{args.language}/"
-        f"pred_{args.language}_{args.domain}_final.jsonl"
-    )
+    # Output: final predictions where Aspect/Opinion are spans from original language text
+    output_path = f"pred_{args.language}_{args.domain}_final.jsonl"
 
-    dev_path = os.path.join(
-        args.data_root,
-        args.subtask,
-        args.language,
-        f"{args.language}_{args.domain}_dev_task3.jsonl",
-    )
+    # ------------------------------------------------------------
+    # 1) Load original dev data (ID -> original-language Text) FROM URL
+    # ------------------------------------------------------------
+    dev_url = f"{args.base_url}/{args.subtask}/{args.language}/{args.language}_{args.domain}_dev_task3.jsonl"
+    rows = read_jsonl_from_url(dev_url)
 
-    with open(dev_path, "r", encoding="utf-8") as f:
-        rows = [json.loads(line) for line in f if line.strip()]
-
-    # Map ID -> original text
+    # Map ID -> original-language text
     id2text: Dict[Any, str] = {r["ID"]: r["Text"] for r in rows}
 
-    hf_home = os.environ.get("HF_HOME", "")
-    model_source = resolve_local_model_path(args.model, hf_home)
-
+    # ------------------------------------------------------------
+    # 2) Load base model ONLINE (instead of local path resolver)
+    # ------------------------------------------------------------
+    model_source = args.model
     tokenizer = AutoTokenizer.from_pretrained(model_source, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -236,12 +216,12 @@ def main() -> None:
     )
     model.eval()
 
-    en_preds_path = (
-        f"/leonardo_work/EUHPC_D19_014/dimABSA/dimABSA/trans_res/"
-        f"{args.subtask}/{args.run_id}/{args.language}/"
-        f"pred_{args.language}_{args.domain}.jsonl"
-    )
-
+    # ------------------------------------------------------------
+    # 3) Load English predictions produced earlier (local file)
+    #    These contain English spans; we'll map them back to original spans.
+    # ------------------------------------------------------------
+    en_preds_path = f"pred_{args.language}_{args.domain}.jsonl"
+    
     out_records: List[Dict[str, Any]] = []
 
     with open(en_preds_path, "r", encoding="utf-8") as f:
@@ -254,7 +234,6 @@ def main() -> None:
                 item = {"src_text": src_text, "quad": quad}
 
                 fixed: Optional[Dict[str, Any]] = None
-                last_err: Optional[Exception] = None
 
                 for _ in range(args.retries):
                     try:
@@ -268,34 +247,31 @@ def main() -> None:
 
                         cand = extract_json(resp)
 
-                        # Must be a dict with required keys; otherwise treat as failure
-                        if isinstance(cand, dict) and "Aspect" in cand and "Opinion" in cand:
+                        # Accept only dicts with required keys
+                        if isinstance(cand, dict) and "Aspect" in cand and "Opinion" in cand and "Category" in cand and "VA" in cand:
                             fixed = cand
                             break
-                        else:
-                            fixed = None
                     except Exception as e:
-                        last_err = e
-                        fixed = None
+                        if args.verbose_errors:
+                            print(f"[WARN] ID={pred.get('ID')} retry failed: {e}")
 
-                # If we failed, keep original English quad (your original behavior)
+                # If matching fails, keep the original English quad
                 if fixed is None:
                     fixed = quad
 
-                # Final anchoring back to exact surface form
+                # Anchor spans to the exact substring surface form in the original text
                 fixed["Aspect"] = get_original_span(src_text, fixed.get("Aspect", ""))
                 fixed["Opinion"] = get_original_span(src_text, fixed.get("Opinion", ""))
 
                 new_quads.append(fixed)
 
-            out_records.append(
-                {
-                    "ID": pred["ID"],
-                    "Text": src_text,
-                    "Quadruplet": new_quads,
-                }
-            )
+            out_records.append({
+                "ID": pred["ID"],
+                "Text": src_text,
+                "Quadruplet": new_quads,
+            })
 
+    # Write final JSONL
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         for r in out_records:
