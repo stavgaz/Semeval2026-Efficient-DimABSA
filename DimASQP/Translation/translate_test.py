@@ -4,42 +4,59 @@ import requests
 import time
 import re
 from tqdm import tqdm
-from collections import Counter, defaultdict
 import os
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import copy
 
+
+# ============================================================
+# I/O helpers
+# ============================================================
+
 def read_jsonl_from_url(url):
+    """Download JSONL from a URL and parse each line into a dict."""
     resp = requests.get(url)
     resp.raise_for_status()
     return [json.loads(line) for line in resp.text.splitlines()]
 
 def write_jsonl(path, rows):
+    """Write a list[dict] to JSONL on disk."""
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 def chunked(lst, size):
+    """Yield consecutive chunks of `lst` of length `size`."""
     for i in range(0, len(lst), size):
         yield lst[i:i + size]
 
+
 # ============================================================
-# Prompt (UNCHANGED – exactly yours)
+# Prompt
 # ============================================================
 
 def build_prompt(batch, language="eng"):
+    """
+    Build a strict translation prompt for *prediction* (dev/test) data.
 
+    Here we only translate the field:
+      - Text
+
+    The output must preserve the same JSON objects and order.
+    """
     if language == "rus":
-        p = 'Russian'
-    elif language == 'tat':
-        p = 'Tatar'
-    elif language == 'ukr':
-        p = 'Ukrainian'
-    elif language == 'zho':
-        p = 'Chinese'
-    elif language == 'jpn':
-        p = 'Japanese'
+        p = "Russian"
+    elif language == "tat":
+        p = "Tatar"
+    elif language == "ukr":
+        p = "Ukrainian"
+    elif language == "zho":
+        p = "Chinese"
+    elif language == "jpn":
+        p = "Japanese"
+    else:
+        raise ValueError(f"Unsupported language code: {language}")
 
     return (
         f"You are translating a sentiment annotation dataset from {p} to English.\n"
@@ -52,44 +69,28 @@ def build_prompt(batch, language="eng"):
         "3. Do NOT add, remove, rename, or reorder any fields.\n\n"
 
         "FIELD TRANSLATION RULES (MANDATORY):\n"
-        "4. You MUST translate ALL of the following fields into English EVERY TIME:\n"
-        "   - Text\n"
+        "4. You MUST translate the field:\n"
+        "   - Text\n\n"
 
         "FINAL CHECK:\n"
-        f"13. Ensure NO {p} characters remain.\n"
-        "14. Only then output the JSON.\n\n"
+        f"5. Ensure NO {p} characters remain.\n"
+        "6. Only then output the JSON.\n\n"
 
         "Translate the following JSON:\n"
         + json.dumps(batch, ensure_ascii=False)
     )
 
+
 # ============================================================
 # Robust JSON extractor
 # ============================================================
 
-def resolve_local_model_path(model_id: str, hf_home: str) -> str:
-    """
-    Map a HF model id to the local directory where we downloaded it.
-    Falls back to model_id if not found.
-    """
-    mapping = {
-        "meta-llama/Llama-3.1-8B-Instruct": os.path.join(hf_home, "models", "meta-llama__Llama-3.1-8B-Instruct"),
-        "Qwen/Qwen2.5-7B-Instruct":         os.path.join(hf_home, "models", "Qwen__Qwen2.5-7B-Instruct"),
-        "Qwen/Qwen2.5-14B-Instruct":        os.path.join(hf_home, "models", "Qwen__Qwen2.5-14B-Instruct"),
-    }
-    local = mapping.get(model_id, model_id)
-    # If it looks like a local path, validate it has config.json
-    if os.path.isdir(local):
-        cfg = os.path.join(local, "config.json")
-        if not os.path.exists(cfg):
-            raise RuntimeError(f"Local model dir exists but missing config.json: {local}")
-    return local
-
 def extract_json(text):
+    """Extract the first valid JSON object/list from model output."""
     if not text:
         raise ValueError("Empty output")
 
-    # Attempt 1: strict extraction
+    # Attempt 1: bracket-stack extraction from the first '{' or '['
     try:
         start = min(i for i in [text.find("["), text.find("{")] if i != -1)
         stack = []
@@ -104,7 +105,7 @@ def extract_json(text):
     except Exception:
         pass
 
-    # Attempt 2: relaxed cleanup (remove trailing commas)
+    # Attempt 2: cleanup trailing commas (common LLM JSON failure mode)
     cleaned = re.sub(r",\s*([}\]])", r"\1", text)
     try:
         start = min(i for i in [cleaned.find("["), cleaned.find("{")] if i != -1)
@@ -112,27 +113,34 @@ def extract_json(text):
     except Exception as e:
         raise ValueError("Model returned invalid JSON") from e
 
+
+# ============================================================
+# Generation wrapper
+# ============================================================
+
+def translate(prompt, model_name=None):
+    """
+    Generate translation using the loaded HF model/tokenizer.
+    `model_name` is unused; kept so the call site stays simple.
+    """
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=500,
+            temperature=0.0,
+            top_p=0.1,
+            do_sample=False
+        )
+
+    generated = output_ids[0][inputs["input_ids"].shape[-1]:]
+    return tokenizer.decode(generated, skip_special_tokens=True)
+
+
 # ============================================================
 # Main
 # ============================================================
-
-def ollama_translate(prompt, model_name=None):
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt"
-        ).to(model.device)
-
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=500,
-                temperature=0.0,
-                top_p=0.1,
-                do_sample=False
-            )
-
-        generated = output_ids[0][inputs["input_ids"].shape[-1]:]
-        return tokenizer.decode(generated, skip_special_tokens=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -142,43 +150,37 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument(
-                    "--data_root",
-                    type=str,
-                    default="/leonardo_work/EUHPC_D19_014/dimABSA/data/track_a",
-                    help="Local root for track_a (offline). Layout: data_root/subtask/lang/*.jsonl",
-                )
+        "--base_url",
+        type=str,
+        default="https://cdn.jsdelivr.net/gh/DimABSA/DimABSA2026@main/task-dataset/track_a/",
+        help="Base URL for data"
+    )
     args = parser.parse_args()
 
-    output = f"/leonardo_work/EUHPC_D19_014/dimABSA/dimABSA/translated_for_pred_{args.language}_{args.domain}_final.jsonl"
-    train_path = os.path.join(
-        args.data_root,
-        args.subtask,
-        args.language,
-        f"{args.language}_{args.domain}_dev_task3.jsonl",
-    )
-    print(f"Loading training data from: {train_path}")
+    # Output file
+    output = f"./translated_for_pred_{args.language}_{args.domain}_final.jsonl"
 
-    with open(train_path, "r", encoding="utf-8") as f:
-        train_raw = [json.loads(line) for line in f if line.strip()]
+    # Input prediction data from URL (dev_task3 as requested)
+    pred_url = f"{args.base_url}/{args.subtask}/{args.language}/{args.language}_{args.domain}_dev_task3.jsonl"
+    print(f"Loading prediction data from: {pred_url}")
+    pred_raw = read_jsonl_from_url(pred_url)
 
-    results = []
+    # Create batches
+    batches = list(chunked(pred_raw, args.batch_size))
 
-    out = []
-
-    batches = list(chunked(train_raw, args.batch_size))
-
-    hf_home = os.environ.get("HF_HOME", "")
-    model_source = resolve_local_model_path(args.model, hf_home)
-    print(f"Loading model from: {model_source}")
-
+    # ------------------------------------------------------------
+    # ONLINE MODEL LOADING
+    # ------------------------------------------------------------
+    model_source = args.model
+    print(f"Loading model from Hugging Face (online): {model_source}")
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_source,
         trust_remote_code=True
     )
 
-    tokenizer.pad_token = tokenizer.eos_token 
-    tokenizer.padding_side = "left" # Correct for batch generation
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
         model_source,
@@ -186,14 +188,14 @@ if __name__ == "__main__":
         device_map="auto",
         trust_remote_code=True
     )
-
     model.eval()
 
-    ID_FIELD = 'ID'
+    ID_FIELD = "ID"
+    out = []
 
-    for batch_idx, batch in enumerate(
-        tqdm(batches, desc="Translating", unit="batch"), 1
-    ):
+    for batch_idx, batch in enumerate(tqdm(batches, desc="Translating", unit="batch"), 1):
+        # Mask IDs before sending to the model so the model doesn't change them.
+        # For prediction/dev data we assume each object only has {ID, Text}.
         masked_batch = []
         ids = []
         for obj in batch:
@@ -207,11 +209,11 @@ if __name__ == "__main__":
 
         for attempt in range(3):
             try:
-                translated = ollama_translate(prompt, model)
+                translated = translate(prompt, model)
 
                 try:
                     parsed = extract_json(translated)
-                except Exception as e:
+                except Exception:
                     parsed = None
 
                 if not parsed:
@@ -219,30 +221,45 @@ if __name__ == "__main__":
                     time.sleep(1)
                     continue
 
-                # restore IDs
+                # We expect a list of objects back
+                if not isinstance(parsed, list):
+                    print(f"[WARN] Batch {batch_idx}: expected JSON list but got {type(parsed).__name__} (attempt {attempt+1})")
+                    time.sleep(1)
+                    continue
+
+                # Ensure the model returned one output object per input object
+                if len(parsed) != len(batch):
+                    print(f"[WARN] Batch {batch_idx}: length mismatch. input={len(batch)} output={len(parsed)} (attempt {attempt+1})")
+                    time.sleep(1)
+                    continue
+
+                # Restore IDs
                 for out_obj, orig_id in zip(parsed, ids):
                     out_obj[ID_FIELD] = orig_id
 
-                # key set must match original
-                for inp_obj, out_obj in zip(batch, parsed):
-                    if set(out_obj.keys()) != set(inp_obj.keys()):
-                        raise ValueError(f"Keys mismatch after restore for ID={inp_obj.get(ID_FIELD)}")
+                # For prediction translation, we enforce only that ID exists and Text exists.
+                # (We don't enforce key sets beyond that, because the input is minimal.)
+                for out_obj in parsed:
+                    if "Text" not in out_obj:
+                        raise ValueError("Missing 'Text' in translated output object")
+                    if ID_FIELD not in out_obj:
+                        raise ValueError("Missing 'ID' after restore")
 
                 out.extend(parsed)
                 success = True
                 break
 
             except Exception as e:
-                print(f"[WARN] Batch {batch_idx}: ollama failure (attempt {attempt+1}) → {e}")
+                print(f"[WARN] Batch {batch_idx}: generation failure (attempt {attempt+1}) → {e}")
                 time.sleep(2)
 
         if not success:
             print(f"[SKIP] Batch {batch_idx} permanently skipped")
-            # OPTIONAL: save skipped batch for later inspection
-            # skipped_batches.append(batch)
             continue
 
         if batch_idx % 10 == 0:
             write_jsonl(output, out)
 
+    # Final write
+    write_jsonl(output, out)
     print("DONE:", output)
