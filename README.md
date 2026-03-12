@@ -9,7 +9,7 @@ Code for our AILS-NTUA submission to **SemEval-2026 Task 3: Dimensional Aspect-B
 Our approach combines:
 - **Encoder fine-tuning** for VA regression (DimASR)
 - **Instruction-tuned LLM generation with LoRA** for structured JSON extraction (DimASTE/DimASQP)
-- 
+
 ---
 
 ## Models
