@@ -18,6 +18,7 @@ https://arxiv.org/abs/2603.04933
 
 If you use this code, please cite:
 
+%
 ```bibtex
 @misc{gazetas2026ailsntuasemeval2026task3,
   title        = {AILS-NTUA at SemEval-2026 Task 3: Efficient Dimensional Aspect-Based Sentiment Analysis},
@@ -28,7 +29,7 @@ If you use this code, please cite:
   primaryClass = {cs.CL},
   url          = {https://arxiv.org/abs/2603.04933}
 }
-```
+```%
 ---
 
 ## Models
