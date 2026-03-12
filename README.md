@@ -9,27 +9,7 @@ Code for our AILS-NTUA submission to **SemEval-2026 Task 3: Dimensional Aspect-B
 Our approach combines:
 - **Encoder fine-tuning** for VA regression (DimASR)
 - **Instruction-tuned LLM generation with LoRA** for structured JSON extraction (DimASTE/DimASQP)
-
-Paper: 
-
-```markdown
-https://arxiv.org/abs/2603.04933
-```
-
-If you use this code, please cite:
-
-
-%```bibtex
-%@misc{gazetas2026ailsntuasemeval2026task3,
-%  title        = {AILS-NTUA at SemEval-2026 Task 3: Efficient Dimensional Aspect-Based Sentiment Analysis},
-%  author       = {Stavros Gazetas and Giorgos Filandrianos and Maria Lymperaiou and Paraskevi Tzouveli and Athanasios Voulodimos and Giorgos Stamou},
-%  year         = {2026},
-%  eprint       = {2603.04933},
-%  archivePrefix= {arXiv},
-%  primaryClass = {cs.CL},
-%  url          = {https://arxiv.org/abs/2603.04933}
-%}
-%```
+- 
 ---
 
 ## Models
